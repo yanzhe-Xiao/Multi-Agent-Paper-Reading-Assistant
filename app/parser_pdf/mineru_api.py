@@ -5,13 +5,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(override=True)
 TOKEN = os.getenv("MINERU_API_TOKEN")
-
+URL=os.getenv("MINERU_URL", "https://mineru.net/api/v4/file-urls/batch")
 doc_path = Path(__file__).parent.parent / "docs"
 print("当前文档目录:", doc_path.resolve())
 # 本地待上传文件
-LOCAL_FILES = [
-    str(doc_path / "Adanav.pdf"),
-]
+
 # 解析参数
 MODEL_VERSION = "vlm"   # 非 HTML 文件可用 pipeline 或 vlm
 LANGUAGE = "en"
@@ -19,12 +17,12 @@ ENABLE_TABLE = True
 ENABLE_FORMULA = True
 IS_OCR = True  # 是否开启 OCR，开启后可解析图片中的文本（如表格、公式等），但会增加解析时间
 
-def apply_upload_urls(token: str, file_paths: list[str]) -> tuple[str, list[str]]:
+def apply_upload_urls(token: str, file_paths: list[str], model_version: str=MODEL_VERSION, language: str=LANGUAGE, enable_table: bool=ENABLE_TABLE, enable_formula: bool=ENABLE_FORMULA) -> tuple[str, list[str]]:
     """
     申请批量上传链接
     返回: (batch_id, file_urls)
     """
-    url = "https://mineru.net/api/v4/file-urls/batch"
+    url = URL
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -41,10 +39,10 @@ def apply_upload_urls(token: str, file_paths: list[str]) -> tuple[str, list[str]
 
     payload = {
         "files": files_payload,
-        "model_version": MODEL_VERSION,
-        "language": LANGUAGE,
-        "enable_table": ENABLE_TABLE,
-        "enable_formula": ENABLE_FORMULA,
+        "model_version": model_version,
+        "language": language,
+        "enable_table": enable_table,
+        "enable_formula": enable_formula,
     }
 
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -106,6 +104,9 @@ def all_finished(extract_result: list[dict]) -> bool:
 
 
 def main():
+    LOCAL_FILES = [
+    str(doc_path / "Adanav.pdf"),
+    ]
     # 校验本地文件
     for fp in LOCAL_FILES:
         if not os.path.exists(fp):

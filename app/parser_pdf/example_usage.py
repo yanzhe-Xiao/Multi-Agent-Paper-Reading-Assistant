@@ -1,7 +1,7 @@
 """
 下载并解压工具使用示例
 """
-from downloader import download_and_extract, extract_file
+from app.parser_pdf.downloader import download_and_extract, extract_file
 
 # 示例 1: 下载并解压一个 ZIP 文件
 def example1():
