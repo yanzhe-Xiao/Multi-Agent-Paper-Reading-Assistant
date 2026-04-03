@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 TOKEN = os.getenv("MINERU_API_TOKEN")
 URL=os.getenv("MINERU_URL", "https://mineru.net/api/v4/file-urls/batch")
-doc_path = Path(__file__).parent.parent / "docs"
+doc_path = Path(__file__).parent.parent.parent / "docs"
 print("当前文档目录:", doc_path.resolve())
 # 本地待上传文件
 
@@ -105,7 +105,7 @@ def all_finished(extract_result: list[dict]) -> bool:
 
 def main():
     LOCAL_FILES = [
-    str(doc_path / "Adanav.pdf"),
+    str(doc_path / "VLN-PETL.pdf"),
     ]
     # 校验本地文件
     for fp in LOCAL_FILES:

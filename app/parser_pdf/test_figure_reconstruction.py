@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.parser_pdf.figure_reconstruction import detect_reconstruction_groups, reconstruct_content_list
+from figure_reconstruction import detect_reconstruction_groups, reconstruct_content_list
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

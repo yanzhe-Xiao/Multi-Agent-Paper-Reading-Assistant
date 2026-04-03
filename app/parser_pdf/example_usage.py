@@ -1,12 +1,12 @@
 """
 下载并解压工具使用示例
 """
-from app.parser_pdf.downloader import download_and_extract, extract_file
+from downloader import download_and_extract, extract_file
 
 # 示例 1: 下载并解压一个 ZIP 文件
 def example1():
     """从 URL 下载并解压"""
-    url = "https://cdn-mineru.openxlab.org.cn/pdf/2026-04-03/caf89a99-eccd-4042-8f87-e3912b1eb2a8.zip"
+    url = "https://cdn-mineru.openxlab.org.cn/pdf/2026-04-03/daaa160f-9ddc-4d9f-bbe1-d6763270e669.zip"
     
     try:
         # 基本用法：自动保存到 downloads 目录，自动解压到同名文件夹
