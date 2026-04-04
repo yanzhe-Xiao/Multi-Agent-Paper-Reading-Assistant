@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Text, ForeignKey
+from sqlalchemy import Column, String, Integer, Text, ForeignKey, Boolean
 from sqlalchemy.orm import relationship
 from .database import Base
 
@@ -29,5 +29,6 @@ class ImgPath(Base):
     paper_id = Column(String(50), ForeignKey("paper.id"), nullable=False, index=True)
     img_id = Column(Integer, nullable=False)
     img_path = Column(String(100), nullable=False)
+    is_check = Column(Boolean, nullable=False, default=False)
 
     paper = relationship("Paper", back_populates="images")

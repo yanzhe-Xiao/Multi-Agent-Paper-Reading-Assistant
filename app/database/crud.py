@@ -56,7 +56,8 @@ def create_image_for_paper(db: Session, paper_id: str, image: schemas.ImgPathCre
     db_image = models.ImgPath(
         paper_id=paper_id,
         img_id=image.img_id,
-        img_path=image.img_path
+        img_path=image.img_path,
+        is_check=image.is_check
     )
 
     db.add(db_image)

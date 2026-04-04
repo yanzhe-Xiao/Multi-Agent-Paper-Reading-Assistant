@@ -3,24 +3,25 @@ from typing import Optional
 
 
 class ImgPathBase(BaseModel):
-    img_id: Optional[int] = None
+    img_id: int
     img_path: str
+    is_check: bool = False
 
 
 class ImgPathCreate(ImgPathBase):
-    img_id: Optional[int] = None
+    pass
 
 
 class ImgPathUpdate(BaseModel):
     """更新图片路径信息，paper_id 不可修改"""
     img_id: Optional[int] = None
     img_path: Optional[str] = None
+    is_check: Optional[bool] = None
 
 
 class ImgPathResponse(ImgPathBase):
     id: int
     paper_id: str
-
     model_config = ConfigDict(from_attributes=True)
 
 
