@@ -10,14 +10,8 @@ doc_path = Path(__file__).parent.parent.parent / "docs"
 print("当前文档目录:", doc_path.resolve())
 # 本地待上传文件
 
-# 解析参数
-MODEL_VERSION = "vlm"   # 非 HTML 文件可用 pipeline 或 vlm
-LANGUAGE = "en"
-ENABLE_TABLE = True
-ENABLE_FORMULA = True
-IS_OCR = True  # 是否开启 OCR，开启后可解析图片中的文本（如表格、公式等），但会增加解析时间
 
-def apply_upload_urls(token: str, file_paths: list[str], model_version: str=MODEL_VERSION, language: str=LANGUAGE, enable_table: bool=ENABLE_TABLE, enable_formula: bool=ENABLE_FORMULA) -> tuple[str, list[str]]:
+def apply_upload_urls(token: str, file_paths: list[str], model_version: str, language: str, enable_table: bool, enable_formula: bool,is_ocr:bool) -> tuple[str, list[str]]:
     """
     申请批量上传链接
     返回: (batch_id, file_urls)
@@ -34,7 +28,7 @@ def apply_upload_urls(token: str, file_paths: list[str], model_version: str=MODE
         files_payload.append({
             "name": p.name,
             "data_id": p.stem,     # 可选，你也可以换成业务 ID
-            "is_ocr": IS_OCR,      # 也可按文件单独设置
+            "is_ocr": is_ocr,      # 也可按文件单独设置
         })
 
     payload = {
@@ -103,9 +97,9 @@ def all_finished(extract_result: list[dict]) -> bool:
     return all(item.get("state") not in unfinished for item in extract_result)
 
 
-def main():
+def get(path:str,model_version: str, language: str, enable_table: bool, enable_formula: bool,is_ocr:bool):
     LOCAL_FILES = [
-    str(doc_path / "VLN-PETL.pdf"),
+    path,
     ]
     # 校验本地文件
     for fp in LOCAL_FILES:
@@ -113,7 +107,7 @@ def main():
             raise FileNotFoundError(fp)
 
     # 1) 申请上传链接
-    batch_id, file_urls = apply_upload_urls(TOKEN, LOCAL_FILES)
+    batch_id, file_urls = apply_upload_urls(TOKEN, LOCAL_FILES,model_version,language,enable_table,enable_formula,is_ocr) # type: ignore
     print("batch_id =", batch_id)
     print("拿到上传链接数量 =", len(file_urls))
 
@@ -122,7 +116,7 @@ def main():
 
     # 3) 轮询批量解析结果
     while True:
-        data = query_batch_result(TOKEN, batch_id)
+        data = query_batch_result(TOKEN, batch_id) # type: ignore
         results = data.get("extract_result", [])
 
         print("\n当前状态：")
@@ -143,12 +137,10 @@ def main():
                 print(f"状态: {state}")
                 if state == "done":
                     print(f"结果包: {zip_url}")
+                    return zip_url
                 else:
                     print(f"失败原因: {err_msg}")
+                    return None
             break
 
         time.sleep(5)
-
-
-if __name__ == "__main__":
-    main()

@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import re
 import shutil
 import subprocess
 import textwrap
@@ -15,6 +16,9 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 ALLOWED_FRAGMENT_TYPES = {"image", "text", "list", "equation", "code"}
+PRIMARY_FIGURE_PATTERN = r"\bFig(?:ure)?\.?\s+\d+\b"
+TEXT_CAPTION_TYPES = {"text", "list"}
+SUBFIGURE_LABEL_PATTERN = r"\([a-zA-Z]\)"
 
 
 @dataclass(frozen=True)
@@ -51,8 +55,44 @@ class ReconstructionGroup:
     ocr_texts: list[str]
 
 
+def caption_text(item: dict[str, Any]) -> str:
+    parts = item.get("image_caption") or []
+    return " ".join(
+        part if isinstance(part, str) else str(part.get("content", ""))
+        for part in parts
+    ).strip()
+
+
+def item_text(item: dict[str, Any]) -> str:
+    return str(item.get("text", "")).strip()
+
+
 def has_caption(item: dict[str, Any]) -> bool:
     return item.get("type") == "image" and bool(item.get("image_caption"))
+
+
+def has_primary_figure_caption(item: dict[str, Any]) -> bool:
+    if item.get("type") == "image":
+        return bool(re.search(PRIMARY_FIGURE_PATTERN, caption_text(item), re.IGNORECASE))
+    if item.get("type") in TEXT_CAPTION_TYPES:
+        return bool(re.search(PRIMARY_FIGURE_PATTERN, item_text(item), re.IGNORECASE))
+    return False
+
+
+def count_primary_figure_captions(item: dict[str, Any]) -> int:
+    if item.get("type") == "image":
+        return len(re.findall(PRIMARY_FIGURE_PATTERN, caption_text(item), re.IGNORECASE))
+    if item.get("type") in TEXT_CAPTION_TYPES:
+        return len(re.findall(PRIMARY_FIGURE_PATTERN, item_text(item), re.IGNORECASE))
+    return 0
+
+
+def is_caption_text_item(item: dict[str, Any]) -> bool:
+    if item.get("type") == "image":
+        return has_caption(item)
+    if item.get("type") in TEXT_CAPTION_TYPES:
+        return bool(re.match(rf"^\s*({PRIMARY_FIGURE_PATTERN}[:.]|{SUBFIGURE_LABEL_PATTERN})", item_text(item), re.IGNORECASE))
+    return False
 
 
 def is_unlabeled_image(item: dict[str, Any]) -> bool:
@@ -61,6 +101,44 @@ def is_unlabeled_image(item: dict[str, Any]) -> bool:
 
 def is_fragment_candidate(item: dict[str, Any]) -> bool:
     return item.get("type") in ALLOWED_FRAGMENT_TYPES and bool(item.get("bbox"))
+
+
+def has_inline_neighbor_image(items: list[dict[str, Any]], item_idx: int) -> bool:
+    item = items[item_idx]
+    bbox = item.get("bbox")
+    page_idx = item.get("page_idx")
+    if not bbox:
+        return False
+
+    for neighbor_idx in range(max(0, item_idx - 2), min(len(items), item_idx + 3)):
+        if neighbor_idx == item_idx:
+            continue
+        neighbor = items[neighbor_idx]
+        if neighbor.get("page_idx") != page_idx or neighbor.get("type") != "image" or not neighbor.get("bbox"):
+            continue
+        neighbor_bbox = neighbor["bbox"]
+        gap_x = axis_gap(bbox[0], bbox[2], neighbor_bbox[0], neighbor_bbox[2])
+        overlap_y = axis_overlap(bbox[1], bbox[3], neighbor_bbox[1], neighbor_bbox[3])
+        if gap_x <= 20 and overlap_y >= 8:
+            return True
+    return False
+
+
+def is_body_text_block(items: list[dict[str, Any]], item_idx: int) -> bool:
+    item = items[item_idx]
+    if item.get("type") not in TEXT_CAPTION_TYPES:
+        return False
+    text = item_text(item)
+    if not text:
+        return False
+    if is_caption_text_item(item):
+        return False
+    bbox = item.get("bbox") or [0, 0, 0, 0]
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    if has_inline_neighbor_image(items, item_idx):
+        return False
+    return len(text) > 180 and height >= 30 and width >= 320
 
 
 def bbox_union(*boxes: list[int] | tuple[int, int, int, int]) -> list[int]:
@@ -84,7 +162,12 @@ def axis_overlap(a0: int, a1: int, b0: int, b1: int) -> int:
     return max(0, min(a1, b1) - max(a0, b0))
 
 
-def is_spatially_connected(current_bbox: list[int], candidate_bbox: list[int]) -> bool:
+def is_spatially_connected(
+    current_bbox: list[int],
+    candidate_bbox: list[int],
+    candidate_type: str | None = None,
+    allow_wide_horizontal_merge: bool = False,
+) -> bool:
     gap_x = axis_gap(current_bbox[0], current_bbox[2], candidate_bbox[0], candidate_bbox[2])
     gap_y = axis_gap(current_bbox[1], current_bbox[3], candidate_bbox[1], candidate_bbox[3])
     overlap_x = axis_overlap(current_bbox[0], current_bbox[2], candidate_bbox[0], candidate_bbox[2])
@@ -96,13 +179,57 @@ def is_spatially_connected(current_bbox: list[int], candidate_bbox: list[int]) -
         return True
     if gap_x <= 24 and overlap_y >= 12:
         return True
+    if candidate_type == "image" and gap_x <= 64 and overlap_y >= 60:
+        return True
+    if allow_wide_horizontal_merge and candidate_type == "image" and gap_x <= 120 and overlap_y >= 60:
+        return True
     if gap_x <= 12 and gap_y <= 12:
         return True
     return False
 
 
+def is_row_aligned_panel(
+    member_bbox: list[int],
+    candidate_bbox: list[int],
+) -> bool:
+    gap_y = axis_gap(member_bbox[1], member_bbox[3], candidate_bbox[1], candidate_bbox[3])
+    overlap_x = axis_overlap(member_bbox[0], member_bbox[2], candidate_bbox[0], candidate_bbox[2])
+    return gap_y <= 72 and overlap_x >= 80
+
+
+def is_connected_to_group(
+    items: list[dict[str, Any]],
+    start_idx: int,
+    end_idx: int,
+    union_bbox: list[int],
+    candidate: dict[str, Any],
+    allow_wide_horizontal_merge: bool = False,
+) -> bool:
+    candidate_bbox = candidate["bbox"]
+    if is_spatially_connected(
+        union_bbox,
+        candidate_bbox,
+        candidate.get("type"),
+        allow_wide_horizontal_merge=allow_wide_horizontal_merge,
+    ):
+        return True
+
+    if candidate.get("type") != "image":
+        return False
+
+    for idx in range(start_idx, end_idx + 1):
+        member = items[idx]
+        if member.get("type") != "image" or not member.get("bbox"):
+            continue
+        if is_row_aligned_panel(member["bbox"], candidate_bbox):
+            return True
+    return False
+
+
 def detect_reconstruction_groups(items: list[dict[str, Any]]) -> list[ReconstructionGroup]:
-    anchor_indices = [idx for idx, item in enumerate(items) if has_caption(item)]
+    anchor_indices = [idx for idx, item in enumerate(items) if has_primary_figure_caption(item)]
+    if not anchor_indices:
+        anchor_indices = [idx for idx, item in enumerate(items) if has_caption(item)]
     groups: list[ReconstructionGroup] = []
 
     for anchor_pos, anchor_idx in enumerate(anchor_indices):
@@ -112,7 +239,51 @@ def detect_reconstruction_groups(items: list[dict[str, Any]]) -> list[Reconstruc
         if group is not None:
             groups.append(group)
 
-    return groups
+    return merge_overlapping_groups(groups, items)
+
+
+def merge_overlapping_groups(
+    groups: list[ReconstructionGroup],
+    items: list[dict[str, Any]],
+) -> list[ReconstructionGroup]:
+    if not groups:
+        return []
+
+    sorted_groups = sorted(groups, key=lambda group: (group.page_idx, group.start_idx, group.end_idx, group.anchor_idx))
+    merged: list[ReconstructionGroup] = []
+
+    for group in sorted_groups:
+        if not merged:
+            merged.append(group)
+            continue
+
+        prev = merged[-1]
+        if prev.page_idx != group.page_idx or group.start_idx > prev.end_idx:
+            merged.append(group)
+            continue
+
+        merged_indices = sorted(set(prev.item_indices) | set(group.item_indices))
+        merged_items = [items[idx] for idx in merged_indices]
+        merged[-1] = ReconstructionGroup(
+            page_idx=prev.page_idx,
+            start_idx=min(prev.start_idx, group.start_idx),
+            end_idx=max(prev.end_idx, group.end_idx),
+            anchor_idx=max(prev.anchor_idx, group.anchor_idx),
+            union_bbox=bbox_union(prev.union_bbox, group.union_bbox),
+            item_indices=merged_indices,
+            fragment_image_paths=[
+                item["img_path"]
+                for item in merged_items
+                if item.get("type") == "image" and item.get("img_path")
+            ],
+            ocr_texts=[
+                item.get("text", "").strip()
+                for item in merged_items
+                if item.get("type") != "image" and item.get("text", "").strip()
+            ],
+        )
+
+    return merged
 
 
 def _detect_single_group(
@@ -126,11 +297,11 @@ def _detect_single_group(
         return None
 
     page_idx = anchor.get("page_idx")
+    anchor_is_text_caption = anchor.get("type") in TEXT_CAPTION_TYPES
+    allow_wide_horizontal_merge = count_primary_figure_captions(anchor) >= 2
     start_idx = anchor_idx
     end_idx = anchor_idx
     union = list(anchor["bbox"])
-    found_unlabeled_image = False
-
     changed = True
     while changed:
         changed = False
@@ -139,15 +310,23 @@ def _detect_single_group(
             candidate = items[prev_idx]
             if candidate.get("page_idx") != page_idx:
                 break
-            if has_caption(candidate):
+            if has_primary_figure_caption(candidate):
                 break
             if not is_fragment_candidate(candidate):
                 break
-            if not is_spatially_connected(union, candidate["bbox"]):
+            if is_body_text_block(items, prev_idx):
+                break
+            if not is_connected_to_group(
+                items,
+                start_idx,
+                end_idx,
+                union,
+                candidate,
+                allow_wide_horizontal_merge=allow_wide_horizontal_merge,
+            ):
                 break
             start_idx = prev_idx
             union = bbox_union(union, candidate["bbox"])
-            found_unlabeled_image = found_unlabeled_image or is_unlabeled_image(candidate)
             changed = True
             prev_idx -= 1
 
@@ -156,22 +335,33 @@ def _detect_single_group(
             candidate = items[next_idx]
             if candidate.get("page_idx") != page_idx:
                 break
-            if has_caption(candidate):
+            if has_primary_figure_caption(candidate):
+                break
+            if anchor_is_text_caption and not is_caption_text_item(candidate):
                 break
             if not is_fragment_candidate(candidate):
                 break
-            if not is_spatially_connected(union, candidate["bbox"]):
+            if is_body_text_block(items, next_idx):
+                break
+            if not is_connected_to_group(
+                items,
+                start_idx,
+                end_idx,
+                union,
+                candidate,
+                allow_wide_horizontal_merge=allow_wide_horizontal_merge,
+            ):
                 break
             end_idx = next_idx
             union = bbox_union(union, candidate["bbox"])
-            found_unlabeled_image = found_unlabeled_image or is_unlabeled_image(candidate)
             changed = True
             next_idx += 1
 
-    if not found_unlabeled_image:
+    item_indices = list(range(start_idx, end_idx + 1))
+    image_item_count = sum(1 for idx in item_indices if items[idx].get("type") == "image")
+    if image_item_count <= 1:
         return None
 
-    item_indices = list(range(start_idx, end_idx + 1))
     fragment_image_paths = [
         item["img_path"]
         for item in (items[idx] for idx in item_indices)
@@ -270,8 +460,20 @@ def build_reconstructed_item(
     dpi: int,
     render_mode: str,
 ) -> tuple[dict[str, Any], Path]:
-    anchor = copy.deepcopy(items[group.anchor_idx])
-    figure_number = extract_figure_number(anchor.get("image_caption") or [])
+    caption_parts = collect_caption_parts(group, items)
+    image_footnotes = collect_image_footnotes(group, items)
+    base_image_item = next(
+        (copy.deepcopy(items[idx]) for idx in group.item_indices if items[idx].get("type") == "image"),
+        None,
+    )
+    if base_image_item is None:
+        base_image_item = {"type": "image", "image_caption": [], "image_footnote": [], "page_idx": group.page_idx}
+
+    anchor = base_image_item
+    anchor["image_caption"] = caption_parts
+    anchor["image_footnote"] = image_footnotes
+
+    figure_number = extract_figure_number(caption_parts)
     file_stem = f"page_{group.page_idx + 1:02d}_figure_{figure_number or group.anchor_idx}"
     output_path = output_image_dir / f"{file_stem}.png"
 
@@ -303,6 +505,40 @@ def build_reconstructed_item(
         "render_source": render_source,
     }
     return anchor, output_path
+
+
+def collect_caption_parts(group: ReconstructionGroup, items: list[dict[str, Any]]) -> list[str]:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for idx in group.item_indices:
+        item = items[idx]
+        if item.get("type") == "image":
+            for part in item.get("image_caption") or []:
+                text = str(part if isinstance(part, str) else part.get("content", "")).strip()
+                if text and text not in seen:
+                    parts.append(text)
+                    seen.add(text)
+        elif is_caption_text_item(item):
+            text = item_text(item)
+            if text and text not in seen:
+                parts.append(text)
+                seen.add(text)
+    return parts
+
+
+def collect_image_footnotes(group: ReconstructionGroup, items: list[dict[str, Any]]) -> list[str]:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for idx in group.item_indices:
+        item = items[idx]
+        if item.get("type") != "image":
+            continue
+        for part in item.get("image_footnote") or []:
+            text = str(part if isinstance(part, str) else part.get("content", "")).strip()
+            if text and text not in seen:
+                parts.append(text)
+                seen.add(text)
+    return parts
 
 
 def render_reconstructed_figure(
@@ -565,12 +801,10 @@ def fit_axis(points: list[tuple[float, float]]) -> tuple[float, float]:
 
 def extract_figure_number(caption_items: list[Any]) -> str | None:
     caption = " ".join(str(item) if isinstance(item, str) else str(item.get("content", "")) for item in caption_items).strip()
-    if not caption.lower().startswith("figure"):
+    match = re.search(PRIMARY_FIGURE_PATTERN, caption, re.IGNORECASE)
+    if not match:
         return None
-    prefix = caption.split(":", 1)[0]
-    parts = prefix.split()
-    if len(parts) < 2:
-        return None
+    parts = match.group(0).split()
     return parts[1].rstrip(".")
 
 

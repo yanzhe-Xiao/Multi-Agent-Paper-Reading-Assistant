@@ -6,7 +6,10 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.parser_pdf.figure_reconstruction import detect_reconstruction_groups, reconstruct_content_list
+try:
+    from .figure_reconstruction import detect_reconstruction_groups, reconstruct_content_list
+except ImportError:
+    from figure_reconstruction import detect_reconstruction_groups, reconstruct_content_list
 
 
 TEXT_LIKE_TYPES = {"text", "list", "equation", "code"}
@@ -64,6 +67,36 @@ def find_block_for_item(blocks: list[str], item: dict[str, Any], start_at: int) 
     return None
 
 
+def reconstruction_group_key(group: Any) -> tuple[int | None, int, int]:
+    return (getattr(group, "page_idx", None), getattr(group, "start_idx"), getattr(group, "end_idx"))
+
+
+def reconstructed_item_key(item: dict[str, Any]) -> tuple[int | None, int, int] | None:
+    reconstruction = item.get("reconstruction") or {}
+    span = reconstruction.get("span")
+    if not isinstance(span, list) or len(span) != 2:
+        return None
+    return (reconstruction.get("page_idx", item.get("page_idx")), span[0], span[1])
+
+
+def build_reconstructed_item_maps(
+    reconstructed_items: list[dict[str, Any]],
+) -> tuple[dict[tuple[int | None, int, int], dict[str, Any]], dict[tuple[int | None, int], dict[str, Any]]]:
+    by_span: dict[tuple[int | None, int, int], dict[str, Any]] = {}
+    by_anchor: dict[tuple[int | None, int], dict[str, Any]] = {}
+    for item in reconstructed_items:
+        span_key = reconstructed_item_key(item)
+        if span_key is not None:
+            by_span[span_key] = item
+
+        reconstruction = item.get("reconstruction") or {}
+        anchor_index = reconstruction.get("anchor_index")
+        page_idx = reconstruction.get("page_idx", item.get("page_idx"))
+        if anchor_index is not None:
+            by_anchor[(page_idx, anchor_index)] = item
+    return by_span, by_anchor
+
+
 def replace_fragmented_figures_in_markdown(
     full_md_path: str | Path,
     original_content_list_path: str | Path,
@@ -90,18 +123,27 @@ def replace_fragmented_figures_in_markdown(
     optimized_items = json.loads(optimized_content_list_path.read_text(encoding="utf-8"))
     groups = detect_reconstruction_groups(original_items)
     reconstructed_items = [item for item in optimized_items if item.get("is_reconstructed_figure")]
-
-    if len(groups) != len(reconstructed_items):
-        raise ValueError(
-            f"Group count mismatch: detected {len(groups)} groups but found {len(reconstructed_items)} reconstructed items."
-        )
+    reconstructed_by_span, reconstructed_by_anchor = build_reconstructed_item_maps(reconstructed_items)
 
     markdown_text = full_md_path.read_text(encoding="utf-8")
     blocks = split_markdown_blocks(markdown_text)
 
     replacements: list[tuple[int, int, str, dict[str, Any]]] = []
     search_cursor = 0
-    for group, new_item in zip(groups, reconstructed_items):
+    used_img_paths: set[str] = set()
+    for group in groups:
+        new_item = reconstructed_by_span.get(reconstruction_group_key(group))
+        if new_item is None:
+            new_item = reconstructed_by_anchor.get((group.page_idx, group.anchor_idx))
+        if new_item is None:
+            raise ValueError(
+                f"Unable to match reconstructed item for figure span {group.start_idx}-{group.end_idx} on page {group.page_idx}."
+            )
+        if new_item["img_path"] in used_img_paths:
+            raise ValueError(
+                f"Reconstructed item {new_item['img_path']} was matched more than once while rewriting Markdown."
+            )
+
         start_block = None
         end_block = None
         local_cursor = search_cursor
@@ -121,6 +163,7 @@ def replace_fragmented_figures_in_markdown(
             )
 
         replacements.append((start_block, end_block, build_replacement_block(new_item), new_item))
+        used_img_paths.add(new_item["img_path"])
         search_cursor = end_block + 1
 
     rewritten_blocks: list[str] = []

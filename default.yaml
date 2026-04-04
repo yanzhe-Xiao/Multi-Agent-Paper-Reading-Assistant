@@ -1,0 +1,21 @@
+# 默认配置
+
+# 模型版本，非 HTML 文件可用 pipeline 或 vlm
+MODEL_VERSION: "vlm"
+
+# 语言设置
+LANGUAGE: "en"
+
+# 是否启用表格解析
+ENABLE_TABLE: true
+
+# 是否启用公式解析
+ENABLE_FORMULA: true
+
+# 是否开启 OCR，开启后可解析图片中的文本（如表格、公式等），但会增加解析时间
+IS_OCR: true
+
+# 文档路径配置
+docs_path: "./docs/"
+
+docs_parser_path: "./docs/docs_parser/"
