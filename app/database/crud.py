@@ -67,3 +67,22 @@ def create_image_for_paper(db: Session, paper_id: str, image: schemas.ImgPathCre
 
 def get_images_by_paper_id(db: Session, paper_id: str):
     return db.query(models.ImgPath).filter(models.ImgPath.paper_id == paper_id).all()
+
+
+def update_image(db: Session, image_id: int, image_update: schemas.ImgPathUpdate):
+    """
+    更新图片路径信息
+    注意：paper_id 不可修改，只能更新 img_id 和 img_path
+    """
+    db_image = db.query(models.ImgPath).filter(models.ImgPath.id == image_id).first()
+    if not db_image:
+        return None
+
+    # 只更新提供的字段（排除 paper_id）
+    update_data = image_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_image, field, value)
+
+    db.commit()
+    db.refresh(db_image)
+    return db_image

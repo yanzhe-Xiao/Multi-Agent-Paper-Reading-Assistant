@@ -11,6 +11,12 @@ class ImgPathCreate(ImgPathBase):
     img_id: Optional[int] = None
 
 
+class ImgPathUpdate(BaseModel):
+    """更新图片路径信息，paper_id 不可修改"""
+    img_id: Optional[int] = None
+    img_path: Optional[str] = None
+
+
 class ImgPathResponse(ImgPathBase):
     id: int
     paper_id: str
