@@ -31,10 +31,10 @@ class PaperAssistant:
         thread_id: str = "default-thread",
         user_preferences: dict | None = None,
     ) -> AgentResponse:
-        paper_ids = paper_ids or self.available_papers()
+        resolved_paper_ids = self._resolve_paper_ids(paper_ids)
         paper_inputs = [
             PaperInput(paper_id=paper_id, title=self.repository.load_paper_title(paper_id))
-            for paper_id in paper_ids
+            for paper_id in resolved_paper_ids
         ]
         graph = self.build()
         result = graph.invoke(
@@ -53,3 +53,19 @@ class PaperAssistant:
             llm=LLMClient(self.config),
         )
         return helper.build_response(result)
+
+    def _resolve_paper_ids(self, paper_ids: list[str] | None) -> list[str]:
+        if paper_ids:
+            return paper_ids
+
+        available = self.available_papers()
+        if not available:
+            raise ValueError("No parsed papers were found. Please upload or parse at least one paper first.")
+
+        if len(available) == 1:
+            return available
+
+        raise ValueError(
+            "Multiple papers are available. Please pass `paper_ids` explicitly, "
+            "or opt in to all papers from the caller."
+        )

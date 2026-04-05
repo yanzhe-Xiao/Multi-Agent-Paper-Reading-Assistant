@@ -20,6 +20,7 @@ except Exception:
 
 
 WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+FIGURE_REF_RE = re.compile(r"(?:fig(?:ure)?\.?)[\s:-]*(\d+)", re.IGNORECASE)
 
 
 class PaperRepository:
@@ -157,24 +158,47 @@ class PaperRepository:
 
         items = json.loads(json_paths[0].read_text(encoding="utf-8"))
         figures: list[FigureAsset] = []
-        img_id = 1
+        seen_pairs: set[tuple[int, str]] = set()
+        fallback_img_id = 1
+
         for item in items:
             if item.get("type") != "image" or "img_path" not in item:
                 continue
+
+            img_path = str(item["img_path"])
             caption_list = item.get("image_caption") or []
-            caption = caption_list[0] if caption_list else None
-            figures.append(
-                FigureAsset(
-                    paper_id=paper_id,
-                    img_id=img_id,
-                    img_path=str(item["img_path"]),
-                    absolute_path=str((paper_dir / str(item["img_path"])).resolve()),
-                    caption=caption,
-                    page_idx=item.get("page_idx"),
+            caption = " ".join(part for part in caption_list if part).strip() or None
+            figure_ids = self._extract_figure_ids_from_captions(caption_list)
+            if not figure_ids:
+                while (fallback_img_id, img_path) in seen_pairs:
+                    fallback_img_id += 1
+                figure_ids = [fallback_img_id]
+                fallback_img_id += 1
+
+            for figure_id in figure_ids:
+                pair = (figure_id, img_path)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                figures.append(
+                    FigureAsset(
+                        paper_id=paper_id,
+                        img_id=figure_id,
+                        img_path=img_path,
+                        absolute_path=str((paper_dir / img_path).resolve()),
+                        caption=caption,
+                        page_idx=item.get("page_idx"),
+                    )
                 )
-            )
-            img_id += 1
-        return figures
+        return sorted(figures, key=lambda item: item.img_id)
+
+    def _extract_figure_ids_from_captions(self, captions: list[str]) -> list[int]:
+        figure_ids: list[int] = []
+        for caption in captions:
+            for match in FIGURE_REF_RE.findall(caption or ""):
+                if match.isdigit():
+                    figure_ids.append(int(match))
+        return self._unique_ints(figure_ids)
 
     def _build_chunks(
         self,
@@ -259,3 +283,13 @@ class PaperRepository:
         ascii_terms = [token.lower() for token in WORD_RE.findall(text)]
         chinese_terms = [char for char in text if "\u4e00" <= char <= "\u9fff"]
         return ascii_terms + chinese_terms
+
+    def _unique_ints(self, values: list[int]) -> list[int]:
+        seen: set[int] = set()
+        result: list[int] = []
+        for value in values:
+            if value in seen:
+                continue
+            seen.add(value)
+            result.append(value)
+        return result
