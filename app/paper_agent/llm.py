@@ -22,15 +22,24 @@ class LLMClient:
 
     def __init__(self, config: PaperAgentConfig):
         self.config = config
+        self.last_error: str | None = None
 
     def is_available(self) -> bool:
         if not self.config.has_llm_config:
+            self.last_error = "OPENAI_API_KEY is not configured."
             return False
         try:
             from langchain_openai import ChatOpenAI  # noqa: F401
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"Failed to import ChatOpenAI: {type(exc).__name__}: {exc}"
             return False
+        self.last_error = None
         return True
+
+    def consume_last_error(self) -> str | None:
+        error = self.last_error
+        self.last_error = None
+        return error
 
     def invoke_structured(
         self,
@@ -48,7 +57,8 @@ class LLMClient:
             from langchain.agents import create_agent
             from langchain.agents.structured_output import ToolStrategy
             from langchain_openai import ChatOpenAI
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"Failed to import LangChain agent components: {type(exc).__name__}: {exc}"
             return None
 
         llm = self._build_model(ChatOpenAI)
@@ -64,10 +74,14 @@ class LLMClient:
             result = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
             structured = result.get("structured_response") if isinstance(result, dict) else None
             if isinstance(structured, schema):
+                self.last_error = None
                 return structured
             if isinstance(structured, dict):
+                self.last_error = None
                 return schema(**structured)
-        except Exception:
+            self.last_error = "Agent invocation finished but did not return a structured_response payload."
+        except Exception as exc:
+            self.last_error = f"Structured agent invocation failed: {type(exc).__name__}: {exc}"
             return None
         return None
 
@@ -85,7 +99,8 @@ class LLMClient:
         try:
             from langchain.agents import create_agent
             from langchain_openai import ChatOpenAI
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"Failed to import LangChain agent components: {type(exc).__name__}: {exc}"
             return None
 
         llm = self._build_model(ChatOpenAI)
@@ -97,9 +112,16 @@ class LLMClient:
                 name=agent_name,
             )
             result = agent.invoke({"messages": [{"role": "user", "content": user_prompt}]})
-        except Exception:
+        except Exception as exc:
+            self.last_error = f"Text agent invocation failed: {type(exc).__name__}: {exc}"
             return None
-        return self._extract_text_from_agent_result(result)
+
+        text = self._extract_text_from_agent_result(result)
+        if text is None:
+            self.last_error = "Agent invocation finished but no AI text message was found."
+            return None
+        self.last_error = None
+        return text
 
     def _build_model(self, chat_openai_cls):
         """创建节点级 Agent 复用的聊天模型实例。"""
