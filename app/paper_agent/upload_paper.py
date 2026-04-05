@@ -124,7 +124,7 @@ Return your summary strictly conforming to the requested format."""
         print(traceback.format_exc())
 
 
-def summarize_paper_to_base(paper_id: str, db: Session, language: str = "Chinese") -> PaperBase:
+def summarize_paper_to_base(paper_id: str,  language: str = "Chinese") -> PaperBase:
     """
     调用 build_agent_and_summarize 获取论文摘要，转换为 PaperBase 格式，并保存图片信息到数据库
     
@@ -174,42 +174,42 @@ def summarize_paper_to_base(paper_id: str, db: Session, language: str = "Chinese
     with get_db_session() as db:
         # 保存 PaperBase 信息到数据库
         create_paper(db, paper_base) # type: ignore
+        # 解析图片映射并保存到数据库
+        try:
+            # 查找 JSON 文件（content_list_optimized.json）
+            json_files = [f for f in os.listdir(paper_dir) if f.endswith('_content_list_optimized.json')]
+            
+            if json_files:
+                json_file_path = os.path.join(paper_dir, json_files[0])
+                print(f"Parsing figure mapping from: {json_file_path}")
+                
+                # 解析图片映射
+                figure_mapping = parse_figure_mapping(json_file_path)
+                print(f"Found {len(figure_mapping)} figure mappings")
+                
 
-
-    # 解析图片映射并保存到数据库
-    try:
-        # 查找 JSON 文件（content_list_optimized.json）
-        json_files = [f for f in os.listdir(paper_dir) if f.endswith('_content_list_optimized.json')]
-        
-        if json_files:
-            json_file_path = os.path.join(paper_dir, json_files[0])
-            print(f"Parsing figure mapping from: {json_file_path}")
-            
-            # 解析图片映射
-            figure_mapping = parse_figure_mapping(json_file_path)
-            print(f"Found {len(figure_mapping)} figure mappings")
-            
-
-            
-            img_id_counter = 1
-            for _, img_path in figure_mapping.items():
-                img_create = ImgPathCreate(
-                    img_id=img_id_counter,
-                    img_path=img_path,
-                    is_check=False
-                )
-                create_image_for_paper(db, paper_id, img_create)
-                print(f"Saved image {img_id_counter}: {img_path}")
-                img_id_counter += 1
-            
-            print(f"Successfully saved {img_id_counter - 1} images to database")
-        else:
-            print(f"No content_list_optimized.json found in {paper_dir}")
-            
-    except Exception as e:
-        print(f"Warning: Failed to save images to database: {e}")
-        import traceback
-        traceback.print_exc()
+                
+                img_id_counter = 1
+                for fig_key, img_path in figure_mapping.items():
+                    img_id = fig_key[len("Figure "):]  # Extract the number from "Figure X"
+                    img_id = int(img_id) if img_id.isdigit() else img_id_counter  # Convert to int if it's a number
+                    img_create = ImgPathCreate(
+                        img_id=img_id,
+                        img_path=img_path,
+                        is_check=False
+                    )
+                    create_image_for_paper(db, paper_id, img_create)
+                    print(f"Saved image {img_id}: {img_path}")
+                    img_id_counter += 1
+                
+                print(f"Successfully saved {img_id_counter - 1} images to database")
+            else:
+                print(f"No content_list_optimized.json found in {paper_dir}")
+                
+        except Exception as e:
+            print(f"Warning: Failed to save images to database: {e}")
+            import traceback
+            traceback.print_exc()
     
     return paper_base
 
@@ -230,10 +230,7 @@ def main():
                   if os.path.isdir(os.path.join(docs_parser_dir, d))]
     
     print(f"Found {len(paper_dirs)} paper directories\n")
-    
-    # 创建数据库会话
-    from app.database.database import SessionLocal
-    db = SessionLocal()
+
     
     try:
         for paper_id in paper_dirs:
@@ -245,7 +242,6 @@ def main():
                 # 调用函数处理论文
                 paper_base = summarize_paper_to_base(
                     paper_id=paper_id,
-                    db=db,
                     language="Chinese"
                 )
                 
@@ -264,6 +260,5 @@ def main():
         print("=" * 80)
         
     finally:
-        db.close()
         print("\nDatabase session closed.")
 

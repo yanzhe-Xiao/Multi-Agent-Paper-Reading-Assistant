@@ -1,12 +1,14 @@
 langchain
 langchain-core
 langchain-community
+langchain-text-splitters
 langchain-openai
 openai
 python-dotenv
 redis
 ipykernel
 langchain_classic
+langgraph
 pymysql
 mysql-connector-python
 unstructured
@@ -17,3 +19,4 @@ langchain-pinecone
 pinecone-client
 rank_bm25
 Pillow
+pytest

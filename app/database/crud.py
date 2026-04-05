@@ -67,7 +67,20 @@ def create_image_for_paper(db: Session, paper_id: str, image: schemas.ImgPathCre
 
 
 def get_images_by_paper_id(db: Session, paper_id: str):
-    return db.query(models.ImgPath).filter(models.ImgPath.paper_id == paper_id).all()
+    return (
+        db.query(models.ImgPath)
+        .filter(models.ImgPath.paper_id == paper_id)
+        .order_by(models.ImgPath.img_id.asc())
+        .all()
+    )
+
+
+def get_image_by_paper_and_img_id(db: Session, paper_id: str, img_id: int):
+    return (
+        db.query(models.ImgPath)
+        .filter(models.ImgPath.paper_id == paper_id, models.ImgPath.img_id == img_id)
+        .first()
+    )
 
 
 def update_image(db: Session, image_id: int, image_update: schemas.ImgPathUpdate):
