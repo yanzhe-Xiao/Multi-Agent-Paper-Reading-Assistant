@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""论文数据仓库模块。
+
+负责论文文本、图表与数据库记录的统一访问，并提供轻量检索与分块能力。
+"""
+
 import json
 import math
 import re
@@ -24,26 +29,33 @@ FIGURE_REF_RE = re.compile(r"(?:fig(?:ure)?\.?)[\s:-]*(\d+)", re.IGNORECASE)
 
 
 class PaperRepository:
+    """论文数据访问层。"""
+
     def __init__(self, config: PaperAgentConfig):
+        """初始化仓库与文档根目录。"""
         self.config = config
         self.docs_root = config.docs_root or (Path(__file__).resolve().parents[2] / "docs" / "docs_parser")
 
     def resolve_paper_dir(self, paper_id: str) -> Path:
+        """解析并校验单篇论文目录。"""
         paper_dir = self.docs_root / paper_id
         if not paper_dir.exists():
             raise FileNotFoundError(f"Paper directory not found for {paper_id}: {paper_dir}")
         return paper_dir
 
     def list_paper_ids(self) -> list[str]:
+        """列出本地可用论文 ID。"""
         if not self.docs_root.exists():
             return []
         return sorted(path.name for path in self.docs_root.iterdir() if path.is_dir())
 
     def load_markdown(self, paper_id: str) -> str:
+        """读取论文主 Markdown 文件内容。"""
         path = self.resolve_paper_dir(paper_id) / "full_optimized.md"
         return path.read_text(encoding="utf-8")
 
     def load_paper_title(self, paper_id: str) -> str | None:
+        """优先从数据库读取标题，失败时从 Markdown 首行推断。"""
         paper = self.load_paper_record(paper_id)
         if paper is not None and getattr(paper, "title", None):
             return str(paper.title)
@@ -58,6 +70,7 @@ class PaperRepository:
         return None
 
     def load_paper_record(self, paper_id: str):
+        """从数据库读取论文记录；数据库不可用时返回 None。"""
         if get_db_session is None or get_paper is None:
             return None
         try:
@@ -67,6 +80,7 @@ class PaperRepository:
             return None
 
     def chunk_markdown(self, paper_id: str) -> list[RetrievedChunk]:
+        """将论文 Markdown 按配置切分为检索块。"""
         text = self.load_markdown(paper_id)
         return list(
             self._build_chunks(
@@ -78,6 +92,7 @@ class PaperRepository:
         )
 
     def retrieve_chunks(self, query: str, paper_ids: list[str], top_k: int | None = None) -> list[RetrievedChunk]:
+        """执行轻量关键词检索并返回排序后的 chunk 列表。"""
         top_k = top_k or self.config.retrieval_top_k
         candidates: list[RetrievedChunk] = []
         for paper_id in paper_ids:
@@ -94,6 +109,7 @@ class PaperRepository:
         return ranked[:top_k]
 
     def compare_papers(self, query: str, paper_ids: list[str], top_k_per_paper: int = 2) -> dict[str, list[RetrievedChunk]]:
+        """按论文分组执行检索，便于多论文对比场景。"""
         comparisons: dict[str, list[RetrievedChunk]] = {}
         for paper_id in paper_ids:
             comparisons[paper_id] = self.retrieve_chunks(
@@ -104,16 +120,19 @@ class PaperRepository:
         return comparisons
 
     def build_figure_map(self, paper_id: str) -> list[FigureAsset]:
+        """构建并按图编号排序图表资源列表。"""
         assets = self.list_figures(paper_id)
         return sorted(assets, key=lambda item: item.img_id)
 
     def list_figures(self, paper_id: str) -> list[FigureAsset]:
+        """优先从数据库读取图表，失败后回退 JSON 解析。"""
         db_assets = self._list_figures_from_db(paper_id)
         if db_assets:
             return db_assets
         return self._list_figures_from_json(paper_id)
 
     def get_figure(self, paper_id: str, img_id: int) -> FigureAsset | None:
+        """按图编号读取单个图表资源。"""
         if get_db_session is not None and get_image_by_paper_and_img_id is not None:
             try:
                 with get_db_session() as db:
@@ -207,6 +226,7 @@ class PaperRepository:
         source_path: str,
         title: str | None,
     ) -> Iterable[RetrievedChunk]:
+        """按段落优先、固定窗口补充的策略构建检索块。"""
         normalized = text.replace("\r\n", "\n")
         paragraphs = [part.strip() for part in normalized.split("\n\n") if part.strip()]
 
@@ -258,6 +278,7 @@ class PaperRepository:
             )
 
     def _score_chunk(self, content: str, query_terms: list[str]) -> float:
+        """对单个 chunk 做词频相关性打分。"""
         if not content.strip():
             return 0.0
         tokens = self._tokenize(content)
@@ -280,6 +301,7 @@ class PaperRepository:
         return score
 
     def _tokenize(self, text: str) -> list[str]:
+        """对英文词与中文字符做混合切分。"""
         ascii_terms = [token.lower() for token in WORD_RE.findall(text)]
         chinese_terms = [char for char in text if "\u4e00" <= char <= "\u9fff"]
         return ascii_terms + chinese_terms

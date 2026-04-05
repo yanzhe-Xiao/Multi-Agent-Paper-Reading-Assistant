@@ -49,37 +49,53 @@ class PaperAgentNodes:
     def initialize(self, state: PaperAgentState) -> PaperAgentState:
         """初始化本轮状态。"""
         query = state["user_query"].strip()
+        self.llm.reset_call_budget(self.config.max_model_calls)
+        self._progress("initialize", f"Starting request: {query[:120]}", state)
         messages = state.get("messages", [])
         if not messages:
             messages = [{"role": "user", "content": query}]
 
         paper_inputs = state.get("paper_inputs") or []
-        max_iterations = state.get("max_iterations") or self.config.max_iterations
+        self._progress(
+            "initialize",
+            f"Prepared {len(paper_inputs)} paper input(s).",
+            state,
+        )
         return {
             "messages": messages,
             "paper_inputs": paper_inputs,
-            "max_iterations": max_iterations,
-            "iteration_count": state.get("iteration_count", 0),
             "user_preferences": state.get("user_preferences", {}),
         }
 
     def planner(self, state: PaperAgentState) -> PaperAgentState:
         """运行规划节点，输出下一步动作。"""
+        self._progress("planner", "Planning next action.", state)
         decision = self._plan_next_action(state)
+        budget_snapshot = self._runtime_budget_snapshot(state)
+        self._progress("planner", f"Decision => {decision.next_action}. {decision.reasoning}", state)
         return {
             "planner_decision": decision,
-            "iteration_count": state.get("iteration_count", 0) + 1,
             "tool_results": {
                 "planner": ToolCallRecord(
                     tool_name="planner",
                     status="ok",
-                    summary=f"Planner selected `{decision.next_action}`: {decision.reasoning}",
-                    payload=decision.model_dump(),
+                    summary=(
+                        f"Planner selected `{decision.next_action}`: {decision.reasoning} "
+                        f"(llm={budget_snapshot['llm_calls_used']}/{budget_snapshot['max_model_calls']})"
+                    ),
+                    payload={
+                        **decision.model_dump(),
+                        "budget": budget_snapshot,
+                    },
                 )
             },
         }
 
     def route_after_planner(self, state: PaperAgentState) -> str:
+        if self._is_llm_cap_reached():
+            self._progress("planner_route", "LLM call cap reached -> finalize immediately.", state)
+            return "finalize"
+
         decision = state["planner_decision"]
         if decision.next_action == "review":
             return "review_input"
@@ -91,11 +107,13 @@ class PaperAgentNodes:
         """显式检索节点：把检索结果写回共享状态。"""
         decision = state["planner_decision"]
         paper_ids = [item.paper_id for item in state["paper_inputs"]]
-        query = decision.retrieval_query or state["user_query"]
+        planned_query = decision.retrieval_query.strip() if decision.retrieval_query else ""
+        query = planned_query or self._build_contextual_retrieval_query(state)
         chunks = self.toolkit.retrieve_paper_chunks(query=query, paper_ids=paper_ids, top_k=self.config.retrieval_top_k)
 
         existing_ids = {chunk.chunk_id for chunk in state.get("retrieved_chunks", [])}
         new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in existing_ids]
+        self._progress("retrieve", f"query=`{query}` -> {len(chunks)} chunk(s), {len(new_chunks)} new.", state)
         return {
             "retrieved_chunks": new_chunks,
             "tool_results": {
@@ -132,6 +150,7 @@ class PaperAgentNodes:
 
         loaded_count = sum(len(figures) for figures in figure_map.values())
         status = "ok" if loaded_count else "skipped"
+        self._progress("vision", f"Loaded {loaded_count} figure(s).", state)
         return {
             "figure_map": figure_map,
             "tool_results": {
@@ -151,16 +170,22 @@ class PaperAgentNodes:
         """显式分析节点：对已有证据做轻量数值统计。"""
         text = "\n\n".join(chunk.content for chunk in state.get("retrieved_chunks", []))
         result = self.toolkit.run_python_stats(text)
+        self._progress("python", f"{result.status}: {result.summary}", state)
         return {"tool_results": {"run_python_stats": result}}
 
     def web(self, state: PaperAgentState) -> PaperAgentState:
-        """显式联网节点：当前仍是接口占位。"""
-        result = self.toolkit.search_web(state["user_query"])
+        """显式联网节点：调用外部搜索工具并记录结果。"""
+        decision = state.get("planner_decision")
+        planned_query = decision.retrieval_query.strip() if decision and decision.retrieval_query else ""
+        query = planned_query or self._build_contextual_web_query(state)
+        result = self.toolkit.search_web(query)
+        self._progress("web", f"query=`{query}` | {result.status}: {result.summary}", state)
         return {"tool_results": {"search_web": result}}
 
     def review_input(self, state: PaperAgentState) -> PaperAgentState:
         """记录当前进入哪种审阅模式。"""
         decision = state["planner_decision"]
+        self._progress("review_input", f"Entering `{decision.mode}` review mode.", state)
         return {
             "tool_results": {
                 "review_input": ToolCallRecord(
@@ -175,22 +200,26 @@ class PaperAgentNodes:
     def methodology_review(self, state: PaperAgentState) -> PaperAgentState:
         """方法论评审 Agent。"""
         note = self._review("methodology", METHODOLOGY_REVIEW_SYSTEM_PROMPT, state)
+        self._progress("methodology_review", note.summary[:160], state)
         return {"review_notes": {"methodology": note}}
 
     def experiment_review(self, state: PaperAgentState) -> PaperAgentState:
         """实验评审 Agent。"""
         note = self._review("experiment", EXPERIMENT_REVIEW_SYSTEM_PROMPT, state)
+        self._progress("experiment_review", note.summary[:160], state)
         return {"review_notes": {"experiment": note}}
 
     def critical_review(self, state: PaperAgentState) -> PaperAgentState:
         """批判性评审 Agent。"""
         note = self._review("critic", CRITIC_REVIEW_SYSTEM_PROMPT, state)
+        self._progress("critical_review", note.summary[:160], state)
         return {"review_notes": {"critic": note}}
 
     def consensus(self, state: PaperAgentState) -> PaperAgentState:
         """共识 Agent：汇总多个 reviewer 的意见。"""
         notes = list(state.get("review_notes", {}).values())
-        prompt = consensus_user_prompt(notes)
+        budget_prompt = self._runtime_budget_prompt(state, stage="consensus")
+        prompt = f"{budget_prompt}\n\n{consensus_user_prompt(notes)}"
         llm_note = self.llm.invoke_structured(
             CONSENSUS_SYSTEM_PROMPT,
             prompt,
@@ -202,6 +231,9 @@ class PaperAgentNodes:
             llm_note.reviewer = "consensus"
             note = llm_note
         else:
+            llm_error = self.llm.consume_last_error()
+            if llm_error:
+                self._progress("consensus", f"Fallback due to LLM issue: {llm_error}", state)
             strengths: list[str] = []
             weaknesses: list[str] = []
             evidence: list[str] = []
@@ -216,6 +248,8 @@ class PaperAgentNodes:
                 weaknesses=self._unique(weaknesses)[:4],
                 evidence=self._unique(evidence)[:6],
             )
+
+        self._progress("consensus", note.summary[:160], state)
 
         return {
             "review_notes": {"consensus": note},
@@ -233,7 +267,8 @@ class PaperAgentNodes:
         """回答起草 Agent，可在需要时再次调用工具补证据。"""
         figures = self._all_figures(state)
         reviews = list(state.get("review_notes", {}).values())
-        prompt = draft_user_prompt(
+        budget_prompt = self._runtime_budget_prompt(state, stage="draft")
+        prompt = budget_prompt + "\n\n" + draft_user_prompt(
             user_query=state["user_query"],
             chunks=state.get("retrieved_chunks", []),
             reviews=reviews,
@@ -247,7 +282,12 @@ class PaperAgentNodes:
             agent_name="draft_agent",
         )
         if not draft_answer:
+            llm_error = self.llm.consume_last_error()
+            if llm_error:
+                self._progress("draft", f"Fallback due to LLM issue: {llm_error}", state)
             draft_answer = self._fallback_draft(state)
+
+        self._progress("draft", f"Draft ready ({len(draft_answer)} chars).", state)
 
         return {
             "draft_answer": draft_answer,
@@ -260,10 +300,18 @@ class PaperAgentNodes:
             },
         }
 
+    def route_after_draft(self, state: PaperAgentState) -> str:
+        """当 LLM 预算已到上限时，草稿后立即终结，避免再进入 QA 消耗回合。"""
+        if self._is_llm_cap_reached():
+            self._progress("draft_route", "LLM call cap reached -> finalize immediately.", state)
+            return "finalize"
+        return "qa"
+
     def qa(self, state: PaperAgentState) -> PaperAgentState:
         """质量评估 Agent，判断是否需要补信息或重写。"""
         reviews = list(state.get("review_notes", {}).values())
-        prompt = quality_user_prompt(
+        budget_prompt = self._runtime_budget_prompt(state, stage="qa")
+        prompt = budget_prompt + "\n\n" + quality_user_prompt(
             user_query=state["user_query"],
             draft_answer=state.get("draft_answer", ""),
             reviews=reviews,
@@ -277,7 +325,12 @@ class PaperAgentNodes:
             agent_name="qa_agent",
         )
         if report is None:
+            llm_error = self.llm.consume_last_error()
+            if llm_error:
+                self._progress("qa", f"Fallback due to LLM issue: {llm_error}", state)
             report = self._fallback_quality_report(state)
+
+        self._progress("qa", f"verdict={report.verdict}, score={report.quality_score:.2f}", state)
 
         return {
             "quality_report": report,
@@ -293,24 +346,31 @@ class PaperAgentNodes:
         }
 
     def route_after_qa(self, state: PaperAgentState) -> str:
-        report = state["quality_report"]
-        if report.verdict == "pass":
+        if self._is_llm_cap_reached():
+            self._progress("qa_route", "LLM call cap reached -> finalize immediately.", state)
             return "finalize"
 
-        if state.get("iteration_count", 0) >= state.get("max_iterations", self.config.max_iterations):
+        report = state["quality_report"]
+        if report.verdict == "pass":
+            self._progress("qa_route", "Quality pass -> finalize.", state)
             return "finalize"
 
         if report.verdict == "rewrite":
+            self._progress("qa_route", "QA requested rewrite.", state)
             return "rewrite"
 
+        self._progress("qa_route", "QA requested more info -> planner.", state)
         return "planner"
 
     def rewrite(self, state: PaperAgentState) -> PaperAgentState:
         """按 QA 反馈重写答案。"""
         report = state["quality_report"]
         base_draft = state.get("draft_answer", "")
+        rewritten: str | None = None
         if self.llm.is_available():
+            budget_prompt = self._runtime_budget_prompt(state, stage="rewrite")
             prompt = (
+                f"{budget_prompt}\n\n"
                 f"Current draft:\n{base_draft}\n\n"
                 f"Rewrite instructions:\n{report.rewrite_instructions or report.missing_points}\n\n"
                 "Rewrite the answer so it directly addresses the missing points."
@@ -321,9 +381,15 @@ class PaperAgentNodes:
                 tools=self._analysis_tools(),
                 agent_name="rewrite_agent",
             )
-        else:
+            if not rewritten:
+                llm_error = self.llm.consume_last_error()
+                if llm_error:
+                    self._progress("rewrite", f"Fallback due to LLM issue: {llm_error}", state)
+        if not rewritten:
             additions = "\n".join(f"- {item}" for item in (report.rewrite_instructions or report.missing_points))
             rewritten = f"{base_draft}\n\nRevision notes:\n{additions}" if additions else base_draft
+
+        self._progress("rewrite", f"Rewritten draft ({len(rewritten)} chars).", state)
 
         return {
             "draft_answer": rewritten or base_draft,
@@ -340,15 +406,40 @@ class PaperAgentNodes:
     def finalize(self, state: PaperAgentState) -> PaperAgentState:
         """写入最终答案。"""
         final_answer = state.get("draft_answer") or self._fallback_draft(state)
+        calls, budget = self.llm.get_call_stats()
+        budget_cap_reached = calls >= budget
+        budget_exhausted = self.llm.is_budget_exhausted() or budget_cap_reached
+        self._progress("finalize", f"Final answer prepared ({len(final_answer)} chars).", state)
         return {
             "final_answer": final_answer,
             "messages": [{"role": "assistant", "content": final_answer}],
+            "tool_results": {
+                "llm_budget": ToolCallRecord(
+                    tool_name="llm_budget",
+                    status="error" if budget_exhausted else "ok",
+                    summary=(
+                        f"Model calls used: {calls}/{budget}."
+                        + (
+                            " LLM call cap reached; workflow finalized immediately with available evidence."
+                            if budget_cap_reached
+                            else (" Budget exhausted; workflow switched to fallback behavior." if budget_exhausted else "")
+                        )
+                    ),
+                    payload={
+                        "model_call_count": calls,
+                        "max_model_calls": budget,
+                        "budget_cap_reached": budget_cap_reached,
+                        "budget_exhausted": budget_exhausted,
+                    },
+                )
+            },
         }
 
     def compress_history(self, state: PaperAgentState) -> PaperAgentState:
         """压缩过长历史，保留后续轮次可复用的摘要。"""
         messages = state.get("messages", [])
         if len(messages) <= self.config.keep_recent_messages:
+            self._progress("compress_history", "History short enough, skip compression.", state)
             return {"history_summary": state.get("history_summary", "")}
 
         history_slice = messages[:-self.config.keep_recent_messages]
@@ -359,7 +450,12 @@ class PaperAgentNodes:
             agent_name="history_summary_agent",
         )
         if not summary:
+            llm_error = self.llm.consume_last_error()
+            if llm_error:
+                self._progress("compress_history", f"Fallback summary due to LLM issue: {llm_error}", state)
             summary = " | ".join(message.get("content", "")[:120] for message in history_slice)
+
+        self._progress("compress_history", "Conversation history compressed.", state)
 
         return {"history_summary": summary}
 
@@ -368,7 +464,6 @@ class PaperAgentNodes:
         return AgentResponse(
             final_answer=state.get("final_answer", ""),
             quality_score=state.get("quality_score", 0.0),
-            iterations=state.get("iteration_count", 0),
             tool_results=state.get("tool_results", {}),
             review_notes=state.get("review_notes", {}),
         )
@@ -379,17 +474,32 @@ class PaperAgentNodes:
         retrieved_chunks = state.get("retrieved_chunks", [])
         has_figures = any(state.get("figure_map", {}).values())
         has_reviews = "consensus" in state.get("review_notes", {})
-        max_iterations = state.get("max_iterations", self.config.max_iterations)
-        iteration_count = state.get("iteration_count", 0)
+        query = state["user_query"]
+        mode = "multi_paper" if len(paper_ids) > 1 or COMPARE_QUERY_RE.search(query) else "single_paper"
+        budget_snapshot = self._runtime_budget_snapshot(state)
+
+        if self._is_llm_cap_reached():
+            return PlannerDecision(
+                next_action="finalize",
+                reasoning=(
+                    "LLM call cap reached "
+                    f"({budget_snapshot['llm_calls_used']}/{budget_snapshot['max_model_calls']}); "
+                    "finalize immediately with current evidence."
+                ),
+                retrieval_query=self._build_contextual_retrieval_query(state),
+                mode=mode,
+            )
 
         prompt = planner_user_prompt(
-            user_query=state["user_query"],
+            user_query=query,
             paper_ids=paper_ids,
             retrieved_chunks=retrieved_chunks,
             has_figures=has_figures,
             has_reviews=has_reviews,
-            iteration_count=iteration_count,
-            max_iterations=max_iterations,
+            llm_calls_used=budget_snapshot["llm_calls_used"],
+            max_model_calls=budget_snapshot["max_model_calls"],
+            llm_calls_remaining=budget_snapshot["llm_calls_remaining"],
+            context_summary=self._build_query_subject_summary(state),
         )
         decision = self.llm.invoke_structured(
             PLANNER_SYSTEM_PROMPT,
@@ -401,13 +511,25 @@ class PaperAgentNodes:
         if decision is not None:
             return decision
 
-        query = state["user_query"]
-        mode = "multi_paper" if len(paper_ids) > 1 or COMPARE_QUERY_RE.search(query) else "single_paper"
+        llm_error = self.llm.consume_last_error()
+        if llm_error:
+            self._progress("planner", f"LLM planner unavailable, using fallback policy: {llm_error}", state)
+            if self._is_llm_cap_reached():
+                return PlannerDecision(
+                    next_action="finalize",
+                    reasoning=(
+                        "Model call budget has reached the configured cap; "
+                        "stop planning and finalize using currently available evidence."
+                    ),
+                    retrieval_query=self._build_contextual_retrieval_query(state),
+                    mode=mode,
+                )
+
         if not retrieved_chunks:
             return PlannerDecision(
                 next_action="retrieve",
                 reasoning="No evidence has been retrieved yet.",
-                retrieval_query=query,
+                retrieval_query=self._build_contextual_retrieval_query(state),
                 mode=mode,
             )
         if FIGURE_QUERY_RE.search(query) and not has_figures:
@@ -429,7 +551,7 @@ class PaperAgentNodes:
             return PlannerDecision(
                 next_action="web",
                 reasoning="The user is explicitly asking for recent or external information.",
-                retrieval_query=query,
+                retrieval_query=self._build_contextual_web_query(state),
                 mode=mode,
             )
         if not has_reviews:
@@ -449,7 +571,8 @@ class PaperAgentNodes:
     def _review(self, reviewer: str, system_prompt: str, state: PaperAgentState) -> ReviewNote:
         """单个 reviewer 节点，允许在节点内部自主补检索或读图。"""
         figures = self._all_figures(state)
-        prompt = review_user_prompt(
+        budget_prompt = self._runtime_budget_prompt(state, stage=f"{reviewer}_review")
+        prompt = budget_prompt + "\n\n" + review_user_prompt(
             user_query=state["user_query"],
             chunks=state.get("retrieved_chunks", []),
             figures=figures,
@@ -464,6 +587,10 @@ class PaperAgentNodes:
         if note is not None:
             note.reviewer = reviewer  # type: ignore[assignment]
             return note
+
+        llm_error = self.llm.consume_last_error()
+        if llm_error:
+            self._progress(f"{reviewer}_review", f"Using fallback note: {llm_error}", state)
 
         evidence = [f"{chunk.paper_id}:{chunk.chunk_id}" for chunk in state.get("retrieved_chunks", [])[:4]]
         figure_refs = [f"{figure.paper_id}:Figure {figure.img_id}" for figure in figures[:3]]
@@ -562,6 +689,126 @@ class PaperAgentNodes:
     def _extract_figure_ids(self, text: str) -> list[int]:
         return [int(match) for match in re.findall(r"(?:figure|fig\.?)\s*(\d+)", text, flags=re.IGNORECASE)]
 
+    def _build_query_subject_summary(self, state: PaperAgentState) -> str:
+        """构建主题摘要，供检索 query 生成使用。"""
+        paper_title = next((item.title for item in state.get("paper_inputs", []) if item.title), None)
+        if paper_title:
+            return paper_title.strip()
+
+        for chunk in state.get("retrieved_chunks", [])[:4]:
+            for raw_line in chunk.content.splitlines()[:4]:
+                line = raw_line.strip().lstrip("#").strip()
+                if len(line) >= 8:
+                    return line[:120]
+
+        user_query = re.sub(r"\s+", " ", state.get("user_query", "")).strip()
+        if user_query:
+            return user_query[:120]
+        return "paper topic"
+
+    def _extract_requested_facets(self, user_query: str, is_chinese: bool) -> list[str]:
+        """从用户需求中提取本轮检索关注点。"""
+        lowered = user_query.lower()
+        facets: list[str] = []
+
+        if is_chinese:
+            if "核心" in user_query or "问题" in user_query:
+                facets.append("核心问题")
+            if "方法" in user_query:
+                facets.append("方法")
+            if "实验" in user_query:
+                facets.append("实验")
+            if "局限" in user_query or "限制" in user_query:
+                facets.append("局限")
+            if "贡献" in user_query:
+                facets.append("贡献")
+            if "新" in user_query or "最新" in user_query or "技术" in user_query:
+                facets.append("最新技术进展")
+        else:
+            if "problem" in lowered:
+                facets.append("core problem")
+            if "method" in lowered:
+                facets.append("method")
+            if "experiment" in lowered or "result" in lowered:
+                facets.append("experiments and results")
+            if "limitation" in lowered or "weakness" in lowered:
+                facets.append("limitations")
+            if "contribution" in lowered:
+                facets.append("contributions")
+            if "latest" in lowered or "recent" in lowered or "new" in lowered:
+                facets.append("latest advances")
+
+        if not facets:
+            facets = ["核心问题", "方法", "实验", "局限"] if is_chinese else [
+                "core problem",
+                "method",
+                "experiments",
+                "limitations",
+            ]
+        return facets
+
+    def _build_contextual_retrieval_query(self, state: PaperAgentState) -> str:
+        """构建可脱离对话上下文独立执行的本地检索 query。"""
+        user_query = state.get("user_query", "").strip()
+        is_chinese = bool(re.search(r"[\u4e00-\u9fff]", user_query))
+        subject = self._build_query_subject_summary(state)
+        facets = self._extract_requested_facets(user_query, is_chinese)
+
+        if is_chinese:
+            facet_part = "、".join(facets)
+            return f"主题：{subject}；检索目标：{facet_part}；关键词：摘要 引言 方法 实验 结果 局限 贡献"
+
+        facet_part = ", ".join(facets)
+        return (
+            f"Topic: {subject}; Retrieval objective: {facet_part}; "
+            "Keywords: abstract introduction method experiments results limitations contributions"
+        )
+
+    def _build_contextual_web_query(self, state: PaperAgentState) -> str:
+        """根据当前上下文构造联网检索 query，避免直接复用原始用户句子。"""
+        user_query = state.get("user_query", "").strip()
+        is_chinese = bool(re.search(r"[\u4e00-\u9fff]", user_query))
+        subject = self._build_query_subject_summary(state)
+        facets = self._extract_requested_facets(user_query, is_chinese)
+
+        if is_chinese:
+            facet_part = "、".join(facets)
+            return (
+                f"主题：{subject}；查询目标：{facet_part}；"
+                "查询范围：2025 2026 最新研究；输出：代表性方法、关键改进、可比基线"
+            )
+
+        facet_part = ", ".join(facets)
+        return (
+            f"Topic: {subject}; Search objective: {facet_part}; "
+            "Scope: latest advances in 2025 and 2026; Output: representative methods, key improvements, comparable baselines"
+        )
+
+    def _runtime_budget_snapshot(self, state: PaperAgentState | None = None) -> dict[str, int]:
+        """返回当前轮次可见的预算快照。"""
+        llm_calls_used, max_model_calls = self.llm.get_call_stats()
+
+        return {
+            "llm_calls_used": llm_calls_used,
+            "max_model_calls": max_model_calls,
+            "llm_calls_remaining": max(0, max_model_calls - llm_calls_used),
+        }
+
+    def _runtime_budget_prompt(self, state: PaperAgentState, *, stage: str) -> str:
+        """构造注入到各 Agent 的预算提示，确保每轮变化可见。"""
+        snapshot = self._runtime_budget_snapshot(state)
+        return (
+            f"Runtime budget snapshot (stage={stage}):\n"
+            f"- LLM calls: {snapshot['llm_calls_used']}/{snapshot['max_model_calls']} "
+            f"(remaining={snapshot['llm_calls_remaining']})\n"
+            "If remaining budget is near zero, prioritize producing the best possible final answer immediately."
+        )
+
+    def _is_llm_cap_reached(self) -> bool:
+        """判断是否达到（或触发）LLM 调用上限。"""
+        calls, budget = self.llm.get_call_stats()
+        return calls >= budget or self.llm.is_budget_exhausted()
+
     def _planner_tools(self) -> list:
         """planner 可见的工具集合。"""
         return self.toolkit.to_langchain_tools()
@@ -569,6 +816,14 @@ class PaperAgentNodes:
     def _analysis_tools(self) -> list:
         """review/draft/qa 可见的工具集合。"""
         return self.toolkit.to_langchain_tools()
+
+    def _progress(self, stage: str, message: str, state: PaperAgentState | None = None) -> None:
+        """按配置输出中间进度日志。"""
+        if not self.config.verbose_progress:
+            return
+
+        calls, budget = self.llm.get_call_stats()
+        print(f"[paper-agent][{stage}] llm={calls}/{budget} | {message}", flush=True)
 
     def _unique(self, values: list[str]) -> list[str]:
         seen: set[str] = set()

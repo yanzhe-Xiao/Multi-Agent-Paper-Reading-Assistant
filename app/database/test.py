@@ -1,71 +1,43 @@
-"""
-数据库 CRUD 操作测试
-"""
 import os
-import sys
+
 from dotenv import load_dotenv
+from langchain.agents import create_agent
+from langchain_openrouter import ChatOpenRouter
 
-# 将项目根目录添加到 Python 路径
-project_root = os.path.join(os.path.dirname(__file__), '..', '..')
-sys.path.insert(0, project_root)
+load_dotenv(override=True)
 
-# 在导入任何其他模块之前，先加载 .env 文件
-env_path = os.path.join(project_root, '.env')
-load_dotenv(dotenv_path=env_path, override=True)
-
-# 验证 DATABASE_URL 是否正确加载
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set. Please check your .env file.")
-
-# print(f"✓ Using database: {DATABASE_URL}")
-
-# 现在可以安全地导入其他模块
-from app.database.crud import (
-    create_paper,
-    get_paper,
-    get_papers,
-    update_paper,
-    delete_paper,
-    create_image_for_paper,
-    get_images_by_paper_id,
+model = ChatOpenRouter(
+    model=os.getenv("OPENAI_MODEL"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
 )
-from app.database.schemas import PaperCreate, PaperUpdate, ImgPathCreate
 
-from app.database.database import get_db_session
+agent = create_agent(
+    model=model,
+    system_prompt="你是一个论文阅读助手，帮助用户理解论文内容并回答相关问题。",
+)
 
+for chunk in agent.stream(
+    {"messages": [{"role": "user", "content": "请简要介绍一下Transformer模型的核心思想。"}]},
+    stream_mode="messages",
+    version="v2",   # 关键
+):
+    if chunk["type"] != "messages":
+        continue
 
-# 使用上下文管理器
-# with get_db_session() as db:
-#     paper_data = PaperCreate(
-#                 id="test_003",
-#                 path="/path/to/paper2.pdf",
-#                 title="Another Test Paper",
-#             )
-#     create_paper(db, paper_data)
+    token, metadata = chunk["data"]
 
-# with get_db_session() as db:
-#     paper = get_paper(db, "test_003")
-#     if paper:
-#         print("Retrieved Paper:")
-#         print(f"  ID: {paper.id}")
-#         print(f"  Path: {paper.path}")
-#         print(f"  Title: {paper.title}")
-#         print(f"  Authors: {paper.authors}")
-#         print(f"  One Sentence Summary: {paper.one_sentence}")
-#         print(f"  Core Problem: {paper.core_problem}")
-#         print(f"  Methodology: {paper.methodology}")
-#         print(f"  Experiments: {paper.experiments}")
-#         print(f"  Conclusion: {paper.conclusion}")
-#     else:
-#         print("Paper not found")
+    # 这里一般是 "model"，不是 "agent"
+    if metadata.get("langgraph_node") != "model":
+        continue
 
+    # 优先从标准 content_blocks 里取文本
+    if hasattr(token, "content_blocks") and token.content_blocks:
+        for block in token.content_blocks:
+            if block.get("type") == "text":
+                print(block.get("text", ""), end="", flush=True)
 
-# with get_db_session() as db:
-#     a = update_paper(db,"test_003", PaperUpdate(
-#         one_sentence="This is an updated one-sentence summary."))
-#     print("Updated Paper:", a.one_sentence)
-
-with get_db_session() as db:
-    delete_paper(db, "test_003")
-    print("Paper deleted successfully")
+    # 兜底：有些模型/版本可能直接放在 content
+    elif hasattr(token, "content") and token.content:
+        if isinstance(token.content, str):
+            print(token.content, end="", flush=True)
